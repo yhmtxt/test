@@ -1,0 +1,15 @@
+[project]
+name = "ai-education-platform"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.135.2",
+    "pwdlib[argon2]>=0.3.0",
+    "pyjwt>=2.12.1",
+    "sqlmodel>=0.0.37",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
