@@ -1,5 +1,6 @@
-from uuid import UUID
-from typing import Annotated, AsyncGenerator
+import asyncio
+from uuid import UUID, uuid4
+from typing import Annotated, AsyncGenerator, Any
 from contextlib import asynccontextmanager
 
 from pydantic import BaseModel
@@ -19,9 +20,7 @@ from .config import settings
 from .models import (
     Group,
     User,
-    Classroom,
     UserPublic,
-    ClassroomCreate,
     AdminInfo,
     StudentInfo,
 )
@@ -30,7 +29,6 @@ from .dependences import (
     get_session,
     SessionDep,
     get_current_user,
-    get_current_admin,
 )
 from .utils import (
     verify_password,
@@ -38,7 +36,67 @@ from .utils import (
     create_access_token,
     get_user_from_token,
 )
+from .robot_apis import InitResponse, API, CommandRequest, CommandResponse
 
+
+class Robot:
+    def __init__(self, connection: WebSocket, id: UUID, name: str, apis: list[API]):
+        self.connection = connection
+        self.id = id
+        self.name = name
+        self.apis = apis
+        self.pending_commands: dict[UUID, asyncio.Future] = {}
+
+    def set_future(self, command_id: UUID, future: asyncio.Future):
+        self.pending_commands[command_id] = future
+
+    def get_future(self, command_id: UUID) -> asyncio.Future | None:
+        return self.pending_commands.get(command_id)
+
+    def remove_future(self, command_id: UUID):
+        if command_id in self.pending_commands:
+            del self.pending_commands[command_id]
+
+    def cancel_all_pending(self):
+        for future in self.pending_commands.values():
+            if not future.done():
+                future.set_exception(ConnectionError("机器人已断开"))
+        self.pending_commands.clear()
+
+    # def __getattr__(self, name):
+    #     async def send_command(*args):
+    #         await self.connection.send_json(CommandRequest(id=uuid4(), name=name, parameter=list(args)).model_dump())
+    #     if name in [api.name for api in self.apis]:
+    #         return send_command
+
+class RobotConnectionManager:
+    def __init__(self):
+        self.robots: dict[UUID, Robot] = {}
+
+    def register(self, robot: Robot):
+        self.robots[robot.id] = robot
+
+    def unregister(self, robot_id: UUID):
+        robot = self.robots.pop(robot_id, None)
+        if robot:
+            robot.cancel_all_pending()
+            # 可选：关闭连接
+            # asyncio.create_task(robot.connection.close(code=1000))
+
+    def get(self, robot_id: UUID) -> Robot | None:
+        return self.robots.get(robot_id)
+
+    def list_robots(self) -> list[dict]:
+        return [
+            {
+                "robot_id": r.id,
+                "robot_name": r.name,
+                "apis": [api.model_dump() for api in r.apis]
+            }
+            for r in self.robots.values()
+        ]
+
+robot_manager = RobotConnectionManager()
 
 class WebsocketBroadcastManagerByGroup:
     def __init__(self) -> None:
@@ -92,50 +150,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(lifespan=lifespan)
 
 
-@app.get("/classrooms")
-def get_all_classrooms(session: SessionDep) -> list[Classroom]:
-    classrooms = session.exec(select(Classroom)).all()
-    return list(classrooms)
-
-
-@app.get("/classrooms/{classroom_id}")
-def get_classroom(session: SessionDep, classroom_id: UUID) -> Classroom:
-    classroom = session.get(Classroom, classroom_id)
-    if classroom is None:
-        raise HTTPException(404, "教室不存在")
-    return classroom
-
-
-@app.post("/classrooms", status_code=201, dependencies=[Depends(get_current_admin)])
-def create_classroom(
-    session: SessionDep, classroom_create: ClassroomCreate
-) -> Classroom:
-    classroom = Classroom(name=classroom_create.name)
-    for student_name in classroom_create.student_names:
-        student = User(
-            name=student_name,
-            hashed_password=get_password_hash(settings.INITAL_NORMAL_USER_PASSWORD),
-        )
-        info = StudentInfo(classroom_id=classroom.id, classroom=classroom, user=student)
-        classroom.students.append(info)
-    session.add(classroom)
-    session.commit()
-    session.refresh(classroom)
-    return classroom
-
-
-@app.delete(
-    "/classrooms/{classroom_id}",
-    status_code=204,
-    dependencies=[Depends(get_current_admin)],
-)
-def delete_classrooms(
-    session: SessionDep, classroom: Annotated[Classroom, Depends(get_classroom)]
-) -> None:
-    session.delete(classroom)
-    session.commit()
-
-
 @app.get("/groups")
 def get_all_groups(session: SessionDep) -> list[Group]:
     groups = session.exec(select(Group)).all()
@@ -150,23 +164,24 @@ def get_group(session: SessionDep, group_id: UUID) -> Group:
     return group
 
 
-@app.put("/groups/{group_id}/code", status_code=204)
-def update_code_for_group(
-    session: SessionDep,
-    group: Annotated[Group, Depends(get_group)],
-    user: Annotated[User, Depends(get_current_user)],
-    code: Annotated[str, Body()],
-) -> None:
-    if group.leader is not user:
-        raise HTTPException(403, detail="只有组长能编辑代码")
-    group.code = code
-    session.add(group)
-    session.commit()
-
-
 @app.post("/groups")
-def create_group(session: SessionDep, name: Annotated[str, Body()]) -> Group:
+def create_group(
+    session: SessionDep,
+    user: Annotated[User, Depends(get_current_user)],
+    name: Annotated[str, Body()],
+    student_names: Annotated[list[str], Body()],
+) -> Group:
+    if user.admin_info is None or user.teacher_info is None:
+        raise HTTPException(403, detail="权限不足")
+
     group = Group(name=name)
+    for student_name in student_names:
+        stu = User(
+            name=student_name,
+            hashed_password=get_password_hash(settings.INITAL_NORMAL_USER_PASSWORD),
+        )
+        info = StudentInfo(user=stu)
+        group.students.append(info)
     session.add(group)
     session.commit()
     session.refresh(group)
@@ -240,3 +255,49 @@ async def sync_code(
             await websocket.send_text(code)
     except WebSocketDisconnect:
         code_broadcast_manager.disconnect(websocket)
+
+
+@app.websocket("/web/robot")
+async def connect_robot(websocket: WebSocket, init: Annotated[InitResponse, Query()]) -> None:
+    await websocket.accept()
+
+    robot = Robot(websocket, init.robot_id, init.robot_name, init.apis)
+    while True:
+        msg = await websocket.receive_json()
+        response = CommandResponse(**msg)
+        future = robot.get_future(response.id)
+        if future and not future.done():
+            future.set_result(response)
+        else:
+            pass
+
+# @app.post("/robot/command/{robot_id}")
+# async def send_command(
+#     robot_id: UUID,
+#     command_name: str = Body(..., embed=True),
+#     parameters: list[Any] = Body(..., embed=True)
+# ) -> CommandResponse:
+#     robot = robot_manager.get(robot_id)
+#     if not robot:
+#         raise HTTPException(404, detail="机器人未连接")
+
+#     command_id = uuid4()
+#     future = asyncio.Future()
+#     robot.set_future(command_id, future)
+
+#     try:
+#         # 发送命令
+#         request = CommandRequest(
+#             id=command_id,
+#             name=command_name,
+#             parameter=parameters
+#         )
+#         await robot.connection.send_json(request.model_dump())
+
+#         # 等待响应（超时 10 秒）
+#         response = await asyncio.wait_for(future, timeout=10.0)
+#         return response
+#     except asyncio.TimeoutError:
+#         raise HTTPException(408, detail="命令执行超时")
+#     finally:
+#         robot.remove_future(command_id)
