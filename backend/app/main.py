@@ -1,4 +1,5 @@
 import asyncio
+import json
 from uuid import UUID, uuid4
 from typing import Annotated, AsyncGenerator, Any
 from contextlib import asynccontextmanager
@@ -13,6 +14,7 @@ from fastapi import (
     Query,
     WebSocketDisconnect,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlmodel import select
 
@@ -40,20 +42,20 @@ from .robot_apis import InitResponse, API, CommandRequest, CommandResponse
 
 
 class Robot:
-    def __init__(self, connection: WebSocket, id: UUID, name: str, apis: list[API]):
+    def __init__(self, connection: WebSocket, id: str, name: str, apis: list[API]):
         self.connection = connection
         self.id = id
         self.name = name
         self.apis = apis
-        self.pending_commands: dict[UUID, asyncio.Future] = {}
+        self.pending_commands: dict[str, asyncio.Future] = {}
 
-    def set_future(self, command_id: UUID, future: asyncio.Future):
+    def set_future(self, command_id: str, future: asyncio.Future):
         self.pending_commands[command_id] = future
 
-    def get_future(self, command_id: UUID) -> asyncio.Future | None:
+    def get_future(self, command_id: str) -> asyncio.Future | None:
         return self.pending_commands.get(command_id)
 
-    def remove_future(self, command_id: UUID):
+    def remove_future(self, command_id: str):
         if command_id in self.pending_commands:
             del self.pending_commands[command_id]
 
@@ -71,19 +73,19 @@ class Robot:
 
 class RobotConnectionManager:
     def __init__(self):
-        self.robots: dict[UUID, Robot] = {}
+        self.robots: dict[str, Robot] = {}
 
     def register(self, robot: Robot):
         self.robots[robot.id] = robot
 
-    def unregister(self, robot_id: UUID):
+    def unregister(self, robot_id: str):
         robot = self.robots.pop(robot_id, None)
         if robot:
             robot.cancel_all_pending()
             # 可选：关闭连接
             # asyncio.create_task(robot.connection.close(code=1000))
 
-    def get(self, robot_id: UUID) -> Robot | None:
+    def get(self, robot_id: str) -> Robot | None:
         return self.robots.get(robot_id)
 
     def list_robots(self) -> list[dict]:
@@ -128,6 +130,7 @@ class Token(BaseModel):
     token_type: str
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     create_all_db_and_tables()
@@ -149,6 +152,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/groups")
 def get_all_groups(session: SessionDep) -> list[Group]:
@@ -257,47 +267,60 @@ async def sync_code(
         code_broadcast_manager.disconnect(websocket)
 
 
-@app.websocket("/web/robot")
-async def connect_robot(websocket: WebSocket, init: Annotated[InitResponse, Query()]) -> None:
+@app.websocket("/ws/robot")
+async def connect_robot(websocket: WebSocket, init: Annotated[str, Query()]) -> None:
+    try:
+        init_resp = InitResponse(**json.loads(init))
+    except Exception as e:
+        await websocket.close(code=1011, reason=str(e))
+        return
+
     await websocket.accept()
 
-    robot = Robot(websocket, init.robot_id, init.robot_name, init.apis)
-    while True:
-        msg = await websocket.receive_json()
-        response = CommandResponse(**msg)
-        future = robot.get_future(response.id)
-        if future and not future.done():
-            future.set_result(response)
-        else:
-            pass
+    robot = Robot(websocket, init_resp.robot_id, init_resp.robot_name, init_resp.apis)
+    robot_manager.register(robot)
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            response = CommandResponse(**msg)
+            future = robot.get_future(response.id)
+            if future and not future.done():
+                future.set_result(response)
+            else:
+                pass
+    except WebSocketDisconnect:
+        robot_manager.unregister(init_resp.robot_id)
+    except Exception as e:
+        # 发生其他错误时关闭连接
+        await websocket.close(code=1011, reason=str(e))
 
-# @app.post("/robot/command/{robot_id}")
-# async def send_command(
-#     robot_id: UUID,
-#     command_name: str = Body(..., embed=True),
-#     parameters: list[Any] = Body(..., embed=True)
-# ) -> CommandResponse:
-#     robot = robot_manager.get(robot_id)
-#     if not robot:
-#         raise HTTPException(404, detail="机器人未连接")
+@app.post("/robot/command/{robot_id}")
+async def send_command(
+    robot_id: str,
+    command_name: str = Body(..., embed=True),
+    parameters: list[Any] = Body(..., embed=True)
+) -> CommandResponse:
+    robot = robot_manager.get(robot_id)
+    if not robot:
+        raise HTTPException(404, detail="机器人未连接")
 
-#     command_id = uuid4()
-#     future = asyncio.Future()
-#     robot.set_future(command_id, future)
+    command_id = str(uuid4())
+    future = asyncio.Future() 
+    robot.set_future(command_id, future)
 
-#     try:
-#         # 发送命令
-#         request = CommandRequest(
-#             id=command_id,
-#             name=command_name,
-#             parameter=parameters
-#         )
-#         await robot.connection.send_json(request.model_dump())
+    try:
+        # 发送命令
+        request = CommandRequest(
+            id=command_id,
+            name=command_name,
+            parameter=parameters
+        )
+        await robot.connection.send_json(request.model_dump())
 
-#         # 等待响应（超时 10 秒）
-#         response = await asyncio.wait_for(future, timeout=10.0)
-#         return response
-#     except asyncio.TimeoutError:
-#         raise HTTPException(408, detail="命令执行超时")
-#     finally:
-#         robot.remove_future(command_id)
+        # 等待响应（超时 10 秒）
+        response = await asyncio.wait_for(future, timeout=10.0)
+        return response
+    except asyncio.TimeoutError:
+        raise HTTPException(408, detail="命令执行超时")
+    finally:
+        robot.remove_future(command_id)

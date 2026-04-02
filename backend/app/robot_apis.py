@@ -1,4 +1,3 @@
-from uuid import UUID
 from typing import Any
 
 from pydantic import BaseModel
@@ -19,18 +18,18 @@ class API(BaseModel):
 
 
 class InitResponse(BaseModel):
-    robot_id: UUID
+    robot_id: str
     robot_name: str
     apis: list[API]
 
 
 class CommandRequest(BaseModel):
-    id: UUID
+    id: str
     name: str
     parameter: list[Any]
 
 
 class CommandResponse(BaseModel):
-    id: UUID
+    id: str
     success: bool
     return_data: Any

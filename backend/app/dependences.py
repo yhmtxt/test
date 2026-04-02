@@ -43,6 +43,6 @@ def get_current_user(
 
 
 def get_current_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
-    if not user.is_admin:
+    if user.admin_info is None:
         raise HTTPException(403, "权限不足")
     return user
