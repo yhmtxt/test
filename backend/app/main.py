@@ -42,34 +42,54 @@ from .robot_apis import InitResponse, API, CommandRequest, CommandResponse
 
 
 class Robot:
-    def __init__(self, connection: WebSocket, id: str, name: str, apis: list[API]):
+    def __init__(self, connection: WebSocket, id: str, name: str, apis: list[API]) -> None:
         self.connection = connection
         self.id = id
         self.name = name
         self.apis = apis
         self.pending_commands: dict[str, asyncio.Future] = {}
 
-    def set_future(self, command_id: str, future: asyncio.Future):
+    def set_future(self, command_id: str, future: asyncio.Future) -> None:
         self.pending_commands[command_id] = future
 
     def get_future(self, command_id: str) -> asyncio.Future | None:
         return self.pending_commands.get(command_id)
 
-    def remove_future(self, command_id: str):
+    def remove_future(self, command_id: str) -> None:
         if command_id in self.pending_commands:
             del self.pending_commands[command_id]
 
-    def cancel_all_pending(self):
+    def cancel_all_pending(self) -> None:
         for future in self.pending_commands.values():
             if not future.done():
                 future.set_exception(ConnectionError("机器人已断开"))
         self.pending_commands.clear()
+        
+    async def call_api(self, name, *args) -> Any:
+        command_id = str(uuid4())
+        future = asyncio.Future() 
+        self.set_future(command_id, future)
+ 
+        try:
+            # 发送命令
+            request = CommandRequest(
+                id=command_id,
+                name=name,
+                parameter=list(args),
+            )
+            await self.connection.send_json(request.model_dump())
 
-    # def __getattr__(self, name):
-    #     async def send_command(*args):
-    #         await self.connection.send_json(CommandRequest(id=uuid4(), name=name, parameter=list(args)).model_dump())
-    #     if name in [api.name for api in self.apis]:
-    #         return send_command
+            # 等待响应（超时 10 秒）
+            response = await asyncio.wait_for(future, timeout=10)
+            if not isinstance(response, CommandResponse):
+                raise ValueError
+            if not response.success:
+                raise RuntimeError
+            return response.return_data
+        except asyncio.TimeoutError:
+            raise RuntimeError
+        finally:
+            self.remove_future(command_id)
 
 class RobotConnectionManager:
     def __init__(self):
@@ -197,6 +217,19 @@ def create_group(
     session.refresh(group)
     return group
 
+@app.put("/groups/{group_id}/code", status_code=204)
+async def update_code_for_group(
+    session: SessionDep,
+    group: Annotated[Group, Depends(get_group)],
+    user: Annotated[User, Depends(get_current_user)],
+    code: Annotated[str, Body()],
+) -> None:
+    if group.leader is not user:
+        raise HTTPException(403, detail="只有组长能编辑代码")
+    group.code = code
+    await code_broadcast_manager.broadcast_text(str(group.id), code)
+    session.add(group)
+    session.commit()
 
 @app.get("/users", response_model=UserPublic)
 def get_all_users(session: SessionDep) -> list[User]:
@@ -256,13 +289,7 @@ async def sync_code(
     code_broadcast_manager.connect(str(group.id), websocket)
     try:
         while True:
-            code = await websocket.receive_text()
-            if not user.student_info.leaded_group:
-                await websocket.send_json({"error": "只有组长有编辑权限"})
-            group.code = code
-            session.add(group)
-            session.commit()
-            await websocket.send_text(code)
+            await websocket.receive_text()
     except WebSocketDisconnect:
         code_broadcast_manager.disconnect(websocket)
 
@@ -299,28 +326,10 @@ async def send_command(
     robot_id: str,
     command_name: str = Body(..., embed=True),
     parameters: list[Any] = Body(..., embed=True)
-) -> CommandResponse:
+) -> Any:
     robot = robot_manager.get(robot_id)
     if not robot:
         raise HTTPException(404, detail="机器人未连接")
 
-    command_id = str(uuid4())
-    future = asyncio.Future() 
-    robot.set_future(command_id, future)
-
-    try:
-        # 发送命令
-        request = CommandRequest(
-            id=command_id,
-            name=command_name,
-            parameter=parameters
-        )
-        await robot.connection.send_json(request.model_dump())
-
-        # 等待响应（超时 10 秒）
-        response = await asyncio.wait_for(future, timeout=10.0)
-        return response
-    except asyncio.TimeoutError:
-        raise HTTPException(408, detail="命令执行超时")
-    finally:
-        robot.remove_future(command_id)
+    result = robot.call_api(command_name, *parameters)
+    return result
